@@ -1,0 +1,71 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: api
+    restart: "on-failure"
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    networks:
+      - app
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:18
+    restart: "on-failure"
+    container_name: db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgresauthappdata:/var/lib/postgresql
+    env_file:
+      - .env
+    networks:
+      - app
+    command: >
+      postgres
+      -c max_connections=3500
+      -c synchronous_commit=off
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.4
+    command: start-dev
+    env_file:
+      - .env
+    ports:
+      - "8080:8080"
+    volumes:
+      - keycloakdata:/opt/keycloak/data
+    networks:
+      - app
+
+  mailpit:
+    image: axllent/mailpit
+    ports:
+      - "8025:8025"
+    networks:
+      - app
+
+networks:
+  app:
+    driver: bridge
+volumes:
+  postgresauthappdata:
+  keycloakdata:
