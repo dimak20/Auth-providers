@@ -19,3 +19,4 @@ client_secret_*.json
 
 #Other
 ecs-setup-log.md
+private.auto.tfvars

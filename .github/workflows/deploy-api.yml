@@ -1,0 +1,82 @@
+name: Deploy API
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "frontend/**"
+      - "docs/**"
+      - "infra/**"
+      - "**.md"
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # OIDC token for AWS
+  contents: read
+
+concurrency:
+  group: deploy-api
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: eu-west-1
+  ECR_REPOSITORY: auth-providers-api
+  ECS_CLUSTER: auth-providers
+  ECS_SERVICE: api
+  TASK_FAMILY: auth-providers-api
+  CONTAINER_NAME: api
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        id: image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          TAG=$(git rev-parse --short HEAD)
+          IMAGE="$REGISTRY/$ECR_REPOSITORY:$TAG"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+          # tags are immutable: on a re-run the image already exists, skip the push
+          if aws ecr describe-images --repository-name "$ECR_REPOSITORY" --image-ids imageTag="$TAG" >/dev/null 2>&1; then
+            echo "Image $TAG already in ECR, skipping build"
+            exit 0
+          fi
+
+          docker build --platform linux/amd64 --provenance=false --sbom=false -t "$IMAGE" .
+          docker push "$IMAGE"
+
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition --task-definition "$TASK_FAMILY" \
+            --query taskDefinition > task-definition.json
+
+      - name: Set new image in task definition
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.image.outputs.image }}
+
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          service: ${{ env.ECS_SERVICE }}
+          wait-for-service-stability: true
