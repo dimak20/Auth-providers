@@ -8,6 +8,8 @@ from src.api.v1.deps import get_auth_client
 from src.api.v1.routes import router
 from src.core.settings import get_settings
 from src.infra.db.lifecycle import get_active_manager
+from src.users.exc_handlers import insufficient_scope, invalid_token
+from src.users.exceptions import InsufficientScopeException, InvalidTokenException
 
 
 @asynccontextmanager
@@ -36,6 +38,8 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    app.add_exception_handler(InvalidTokenException, invalid_token) # type: ignore
+    app.add_exception_handler(InsufficientScopeException, insufficient_scope) # type: ignore
     return app
 
 app = create_app()
