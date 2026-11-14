@@ -16,3 +16,6 @@ wheels/
 client_secret_*.json
 .env.*
 !.env.example
+
+#Other
+ecs-setup-log.md
