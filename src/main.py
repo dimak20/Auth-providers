@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.api.health import router as health_router
 from src.api.v1.deps import get_auth_client
 from src.api.v1.routes import router
+from src.core.settings import get_settings
 from src.infra.db.lifecycle import get_active_manager
 
 
@@ -27,10 +28,7 @@ def create_app() -> FastAPI:
     app.include_router(router=router, prefix="/api/v1")
 
 
-    origins = [
-    "http://localhost:5173",
-    "http://localhost:5174",
-]
+    origins = get_settings().CORS_ORIGINS
     app.add_middleware(
         CORSMiddleware,
         allow_origins=origins,

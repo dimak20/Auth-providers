@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     ISSUER: str
     ALGORITHMS: list
     ISSUER_PATH: str
+    CORS_ORIGINS: list
 
     model_config = SettingsConfigDict(
         extra="ignore",
