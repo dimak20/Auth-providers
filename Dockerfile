@@ -1,4 +1,4 @@
-FROM python:3.14-slim as builder
+FROM python:3.14-slim AS builder
 
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
@@ -14,7 +14,7 @@ RUN uv sync --locked
 COPY migrations ./migrations
 COPY src ./src
 
-FROM python:3.14-slim as runner
+FROM python:3.14-slim AS runner
 ENV PYTHONUNBUFFERED=1 \
     PATH="/app/.venv/bin:$PATH"
 
