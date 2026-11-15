@@ -43,6 +43,16 @@ export function OrderDetailPage() {
             <p className="text-2xl font-semibold tabular-nums">{formatCents(order.price_cents)}</p>
           </div>
 
+          {order.photo_url && (
+            <a href={order.photo_url} target="_blank" rel="noreferrer" className="mt-6 block">
+              <img
+                src={order.photo_url}
+                alt="Order photo"
+                className="max-h-96 w-full rounded-xl object-contain ring-1 ring-inset ring-zinc-200"
+              />
+            </a>
+          )}
+
           <dl className="mt-6 grid gap-x-6 gap-y-4 text-sm sm:grid-cols-2">
             <Field label="ID" value={order.id} mono />
             <Field label="Created" value={formatDate(order.created_at)} />

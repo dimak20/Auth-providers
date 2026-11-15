@@ -1,7 +1,9 @@
-from fastapi import APIRouter, Request, Response
+import structlog
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 router = APIRouter()
+log = structlog.get_logger("health")
 
 @router.get("/healthz")
 async def health_controller():
@@ -12,5 +14,24 @@ async def health_controller():
 
 @router.get("/readyz")
 async def ready_controller(req: Request):
-    code = 200 if await req.app.state.db_manager.healthy() else 503
-    return Response(status_code=code)
+    errors = []
+    checks = {
+        "DB": [lambda : req.app.state.db_manager.healthy(), False],
+        "cache": [lambda : req.app.state.redis.ping(), False]
+    }
+    for check, state in checks.items():
+        is_ok = False
+        try:
+            is_ok = bool(await state[0]())
+        except Exception:
+            log.exception("readyz check failed", check=check)
+        finally:
+            state[1] = is_ok
+
+    code = 200
+    for check, state in checks.items():
+        if state[1] is False:
+            code = 503
+            errors.append(check)
+
+    return JSONResponse(status_code=code, content=errors)

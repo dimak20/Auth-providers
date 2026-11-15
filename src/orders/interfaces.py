@@ -25,3 +25,6 @@ class OrderServiceInterface(ABC):
     @abstractmethod
     async def create_order(self, order: Order) -> Order:
         pass
+    @abstractmethod
+    def get_photo_upload_url(self, user_id: UUID, content_type: str) -> tuple[str, str]:
+        pass

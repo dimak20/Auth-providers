@@ -14,7 +14,9 @@ class OrderRepository(OrderRepositoryInterface):
         order_orm = Orders(
             cents_total=order.cents_total,
             qty=order.qty,
-            user_id=order.user_id
+            user_id=order.user_id,
+            photo_key=order.photo_key
+
         )
         self._db.add(order_orm)
         await self._db.commit()

@@ -26,7 +26,7 @@ data "aws_iam_policy_document" "ecs_tasks_assume" {
 data "aws_iam_policy_document" "task_execution_extra" {
   statement {
     actions   = ["secretsmanager:GetSecretValue"]
-    resources = [aws_db_instance.main.master_user_secret[0].secret_arn]
+    resources = [aws_db_instance.main.master_user_secret[0].secret_arn, aws_secretsmanager_secret.redis.arn]
   }
 
   statement {
@@ -93,7 +93,7 @@ data "aws_iam_policy_document" "github_deploy" {
   statement {
     sid       = "PassExecutionRole"
     actions   = ["iam:PassRole"]
-    resources = [aws_iam_role.task_execution.arn]
+    resources = [aws_iam_role.task_execution.arn, aws_iam_role.task.arn]
     condition {
       test     = "StringEquals"
       variable = "iam:PassedToService"
@@ -101,3 +101,19 @@ data "aws_iam_policy_document" "github_deploy" {
     }
   }
 }
+
+data "aws_iam_policy_document" "task_s3" {
+  statement {
+    sid       = "Objects"
+    actions   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
+    resources = ["${aws_s3_bucket.media.arn}/*"]
+  }
+
+  statement {
+    sid       = "List" # without it head_object on a missing key returns 403 instead of 404
+    actions   = ["s3:ListBucket"]
+    resources = [aws_s3_bucket.media.arn]
+  }
+}
+
+data "aws_caller_identity" "current" {}

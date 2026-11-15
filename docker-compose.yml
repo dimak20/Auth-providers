@@ -20,6 +20,61 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+      s3-init:
+        condition: service_completed_successfully
+
+  # local S3-compatible storage (SeaweedFS: master + volume + filer + S3 gateway in one container)
+  s3:
+    image: chrislusf/seaweedfs:latest
+    container_name: s3
+    restart: "on-failure"
+    command: server -dir=/data -s3 -s3.port=8333 -s3.config=/etc/seaweedfs/s3.json
+    ports:
+      - "8333:8333"   # S3 API (presigned URLs from the browser go here)
+    volumes:
+      - s3data:/data
+      - ./seaweedfs/s3.json:/etc/seaweedfs/s3.json:ro
+    networks:
+      - app
+
+  # one-shot: waits for the S3 API, creates the bucket and its CORS rules, exits
+  s3-init:
+    image: amazon/aws-cli:latest
+    depends_on:
+      - s3
+    env_file:
+      - .env
+    environment:
+      AWS_ACCESS_KEY_ID: ${S3__ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${S3__SECRET_ACCESS_KEY}
+      AWS_DEFAULT_REGION: ${S3__REGION}
+    volumes:
+      - ./seaweedfs/cors.json:/cors.json:ro
+    entrypoint: >
+      /bin/sh -c "
+      for i in $$(seq 1 30); do aws --endpoint-url http://s3:8333 s3 ls >/dev/null 2>&1 && break; sleep 2; done;
+      aws --endpoint-url http://s3:8333 s3 mb s3://$${S3__BUCKET} 2>/dev/null || true;
+      aws --endpoint-url http://s3:8333 s3api put-bucket-cors --bucket $${S3__BUCKET} --cors-configuration file:///cors.json || true;
+      aws --endpoint-url http://s3:8333 s3 ls
+      "
+    networks:
+      - app
+
+  redis:
+    image: valkey/valkey:8
+    container_name: redis
+    restart: "on-failure"
+    ports:
+      - "6379:6379"
+    networks:
+      - app
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
 
   db:
     image: postgres:18
@@ -63,9 +118,12 @@ services:
     networks:
       - app
 
+
+
 networks:
   app:
     driver: bridge
 volumes:
   postgresauthappdata:
   keycloakdata:
+  s3data:

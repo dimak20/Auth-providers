@@ -18,3 +18,14 @@ resource "aws_iam_role_policy" "task_execution_extra" {
   role   = aws_iam_role.task_execution.id
   policy = data.aws_iam_policy_document.task_execution_extra.json
 }
+
+resource "aws_iam_role" "task" {
+  name               = "auth-provers-task"
+  assume_role_policy = data.aws_iam_policy_document.ecs_tasks_assume.json
+}
+
+resource "aws_iam_role_policy" "task_s3" {
+  name   = "media_bucket"
+  role   = aws_iam_role.task.id
+  policy = data.aws_iam_policy_document.task_s3.json
+}

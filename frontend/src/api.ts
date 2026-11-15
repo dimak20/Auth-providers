@@ -17,12 +17,33 @@ export type Order = {
   price_cents: number;
   user_id: string;
   created_at: string;
+  photo_url?: string | null; // presigned GET, short-lived
 };
 
 export type OrderCreate = {
   qty: number;
   price_cents: number;
+  url_key?: string; // key returned by requestUploadUrl, after the file was uploaded
 };
+
+export const PHOTO_TYPES = ["image/jpeg", "image/png", "image/webp"] as const;
+export type PhotoType = (typeof PHOTO_TYPES)[number];
+export const PHOTO_MAX_BYTES = 5 * 1024 * 1024;
+
+export type UploadUrl = {
+  upload_url: string;
+  key: string;
+};
+
+/** PUT the file straight to S3 via a presigned URL (no API token: the signature is the auth). */
+export async function uploadToStorage(uploadUrl: string, file: File): Promise<void> {
+  const res = await fetch(uploadUrl, {
+    method: "PUT",
+    headers: { "Content-Type": file.type }, // must match the content type the URL was signed for
+    body: file,
+  });
+  if (!res.ok) throw new ApiError(res.status, `Upload failed: ${res.statusText || res.status}`);
+}
 
 export class ApiError extends Error {
   readonly status: number;
@@ -79,6 +100,8 @@ export function useApi() {
       listOrders: () => request<Order[]>("/orders"),
       getOrder: (id: string) => request<Order>(`/orders/${encodeURIComponent(id)}`),
       createOrder: (data: OrderCreate) => request<Order>("/orders", "POST", data),
+      requestUploadUrl: (contentType: PhotoType) =>
+        request<UploadUrl>("/orders/uploads", "POST", { content_type: contentType }),
     };
   }, [getAccessToken]);
 }

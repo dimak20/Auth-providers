@@ -1,10 +1,12 @@
 from typing import Annotated
 
-from fastapi import Depends
+from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.settings import Settings, get_settings
 from src.infra.db.sessions import get_session
+from src.infra.media.interfaces import StorageMediaInterface
+from src.infra.media.s3 import S3Storage
 from src.orders.interfaces import OrderRepositoryInterface, OrderServiceInterface
 from src.orders.repositories import OrderRepository
 from src.orders.services import OrderService
@@ -41,6 +43,15 @@ async def get_order_repo(
     ) -> OrderRepositoryInterface:
     return OrderRepository(db=db)
 
+def get_storage(
+        request: Request
+):
+    return S3Storage(
+        bucket=api_settings.S3.BUCKET,
+        client_public=request.app.state.s3_public,
+        client_internal=request.app.state.s3_internal
+    )
+
 #services
 async def get_user_service(
         user_repo: Annotated[UserRepositoryInterface, Depends(get_user_repo)]
@@ -48,9 +59,11 @@ async def get_user_service(
     return UserService(user_repo=user_repo)
 
 async def get_order_service(
-        order_repo: Annotated[OrderRepositoryInterface, Depends(get_order_repo)]
+        r: Request,
+        order_repo: Annotated[OrderRepositoryInterface, Depends(get_order_repo)],
+        storage: Annotated[StorageMediaInterface, Depends(get_storage)]
     ) -> OrderServiceInterface:
-    return OrderService(order_repo=order_repo)
+    return OrderService(order_repo=order_repo, redis=r.app.state.redis, media=storage)
 
 async def get_current_user(
         payload: Annotated[dict, Depends(verify_token)],

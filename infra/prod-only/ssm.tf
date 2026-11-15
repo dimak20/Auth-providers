@@ -10,6 +10,15 @@ locals {
     API_AUDIENCE  = "authenticated"
     ALGORITHMS    = jsonencode(["ES256"])
     CORS_ORIGINS  = jsonencode(var.cors_origins)
+
+    REDIS__HOST     = aws_elasticache_serverless_cache.main.endpoint[0].address
+    REDIS__PORT     = tostring(aws_elasticache_serverless_cache.main.endpoint[0].port)
+    REDIS__SSL      = "true"
+    REDIS__CLUSTER  = "true"
+    REDIS__USERNAME = aws_elasticache_user.app.user_name
+
+    S3__BUCKET = aws_s3_bucket.media.bucket
+    S3__REGION = var.region
   }
 }
 
