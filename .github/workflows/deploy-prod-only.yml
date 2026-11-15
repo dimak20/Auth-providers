@@ -1,13 +1,7 @@
-name: Deploy API
+name: Deploy API (prod-only layout)
 
+# For infra/prod-only. Manual run only: the multi-env layout uses deploy.yml.
 on:
-  push:
-    branches: [main]
-    paths-ignore:
-      - "frontend/**"
-      - "docs/**"
-      - "infra/**"
-      - "**.md"
   workflow_dispatch:
 
 permissions:
@@ -15,7 +9,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: deploy-api
+  group: deploy-prod-only
   cancel-in-progress: false
 
 env:

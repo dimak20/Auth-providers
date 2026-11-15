@@ -10,7 +10,7 @@ terraform {
 
   backend "s3" {
     bucket       = "dimak-auth-tfstate-982081081998"
-    key          = "prod/terraform.tfstate"
+    key          = "prod-only/terraform.tfstate"
     region       = "eu-west-1"
     profile      = "dev"
     use_lockfile = true

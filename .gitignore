@@ -19,4 +19,8 @@ client_secret_*.json
 
 #Other
 ecs-setup-log.md
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
 private.auto.tfvars

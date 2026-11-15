@@ -1,0 +1,135 @@
+name: Deploy (stage → prod)
+
+# For infra/multi-env. Push to main → build image once → deploy to stage →
+# wait for approval (GitHub Environment "production") → deploy the same image to prod
+# and release the prod frontend.
+#
+# GitHub → Settings → Environments:
+#   staging:    variables AWS_ROLE_ARN
+#   production: variables AWS_ROLE_ARN, AMPLIFY_APP_ID; protection rule "Required reviewers"
+# Values: `terraform output` in infra/multi-env/envs/<env>.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "infra/**"
+      - "**.md"
+  workflow_dispatch:
+
+permissions:
+  id-token: write # OIDC token for AWS
+  contents: read
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: eu-west-1
+  ECR_REPOSITORY: auth-providers-api
+  CONTAINER_NAME: api
+  ECS_SERVICE: api
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    environment: staging # the stage role is allowed to push to the shared ECR
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        id: image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          TAG=$(git rev-parse --short HEAD)
+          IMAGE="$REGISTRY/$ECR_REPOSITORY:$TAG"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+          # tags are immutable: on a re-run the image already exists, skip the push
+          if aws ecr describe-images --repository-name "$ECR_REPOSITORY" --image-ids imageTag="$TAG" >/dev/null 2>&1; then
+            echo "Image $TAG already in ECR, skipping build"
+            exit 0
+          fi
+
+          docker build --platform linux/amd64 --provenance=false --sbom=false -t "$IMAGE" .
+          docker push "$IMAGE"
+
+  deploy-stage:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: staging
+    env:
+      ECS_CLUSTER: auth-providers-stage
+      TASK_FAMILY: auth-providers-stage-api
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download current task definition
+        run: aws ecs describe-task-definition --task-definition "$TASK_FAMILY" --query taskDefinition > task-definition.json
+
+      - id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ needs.build.outputs.image }}
+
+      - uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          service: ${{ env.ECS_SERVICE }}
+          wait-for-service-stability: true
+
+      # stage frontend is built by Amplify itself on every push (auto build on)
+
+  deploy-prod:
+    needs: [build, deploy-stage]
+    runs-on: ubuntu-latest
+    environment: production # waits here for the required reviewer
+    env:
+      ECS_CLUSTER: auth-providers-prod
+      TASK_FAMILY: auth-providers-prod-api
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download current task definition
+        run: aws ecs describe-task-definition --task-definition "$TASK_FAMILY" --query taskDefinition > task-definition.json
+
+      - id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ needs.build.outputs.image }}
+
+      - uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          service: ${{ env.ECS_SERVICE }}
+          wait-for-service-stability: true
+
+      - name: Release prod frontend (Amplify)
+        run: |
+          aws amplify start-job --app-id "${{ vars.AMPLIFY_APP_ID }}" --branch-name main \
+            --job-type RELEASE --commit-id "$GITHUB_SHA" --query "jobSummary.jobId" --output text
