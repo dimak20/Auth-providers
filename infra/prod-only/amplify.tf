@@ -25,6 +25,13 @@ resource "aws_amplify_app" "frontend" {
               - .npm/**/*
   YAML
 
+  # SPA: every path without a file extension is served by index.html (client-side routing)
+  custom_rule {
+    source = "</^[^.]+$|\\.(?!(css|gif|ico|jpg|jpeg|js|png|txt|svg|woff|woff2|ttf|map|json|webp)$)([^.]+$)/>"
+    target = "/index.html"
+    status = "200"
+  }
+
   environment_variables = {
     AMPLIFY_MONOREPO_APP_ROOT = "frontend"
     VITE_API_URL              = "https://api.dimak-auth.xyz"
