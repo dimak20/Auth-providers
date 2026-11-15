@@ -5,6 +5,7 @@ from src.core.settings import get_settings
 
 s = get_settings().S3
 def create_s3_clients():
+    regional = f"https://s3.{s.REGION}.amazonaws.com"
     cfg = Config(
         signature_version="s3v4",
         s3={"addressing_style": "path"} if s.ENDPOINT_URL else {},
@@ -16,8 +17,8 @@ def create_s3_clients():
         aws_secret_access_key=s.SECRET_ACCESS_KEY,
         config=cfg,
     )
-    internal = boto3.client("s3", endpoint_url=s.ENDPOINT_URL, **common)
-    public = boto3.client("s3", endpoint_url=s.PUBLIC_ENDPOINT_URL or s.ENDPOINT_URL, **common)
+    internal = boto3.client("s3", endpoint_url=s.ENDPOINT_URL or regional, **common)
+    public = boto3.client("s3", endpoint_url=s.PUBLIC_ENDPOINT_URL or s.ENDPOINT_URL or regional, **common)
     return internal, public
 
 def generate_presigned_put(client, key, content_type):
