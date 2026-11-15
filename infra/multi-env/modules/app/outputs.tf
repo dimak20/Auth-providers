@@ -25,3 +25,11 @@ output "amplify_app_id" {
 output "github_deploy_role_arn" {
   value = aws_iam_role.github_deploy.arn
 }
+
+output "redis_endpoint" {
+  value = aws_elasticache_serverless_cache.main.endpoint[0].address
+}
+
+output "media_bucket" {
+  value = aws_s3_bucket.media.bucket
+}

@@ -37,10 +37,11 @@ Placeholders used below (the screenshots are masked the same way):
 19. [Frontend on AWS Amplify](#19-frontend-on-aws-amplify)
 20. [Wiring frontend and backend together](#20-wiring-frontend-and-backend-together)
 21. [Production hardening](#21-production-hardening)
-22. [Verification](#22-verification)
-23. [Costs and pausing overnight](#23-costs-and-pausing-overnight)
-24. [Notes for Terraform](#24-notes-for-terraform)
-25. [Troubleshooting](#25-troubleshooting)
+22. [Cache (Valkey) and media storage (S3)](#22-cache-valkey-and-media-storage-s3)
+23. [Verification](#23-verification)
+24. [Costs and pausing overnight](#24-costs-and-pausing-overnight)
+25. [Notes for Terraform](#25-notes-for-terraform)
+26. [Troubleshooting](#26-troubleshooting)
 
 ## Architecture
 
@@ -56,8 +57,10 @@ Browser ─► app.dimak-auth.xyz ─► AWS Amplify (React build, Amplify-manag
                               │                         │
                               ▼                         ▼
                    RDS PostgreSQL (private)     NAT gateway → internet
-                                                (ECR API, JWKS, CloudWatch)
-                   S3 gateway endpoint ← ECR image layers
+                   Valkey Serverless (private)  (ECR API, JWKS, CloudWatch)
+                   S3 gateway endpoint ← ECR image layers, media bucket
+
+Browser ─► presigned PUT/GET ─► S3 media bucket (order photos)
 ```
 
 | Layer | Resource | Name |
@@ -68,6 +71,8 @@ Browser ─► app.dimak-auth.xyz ─► AWS Amplify (React build, Amplify-manag
 | Images | ECR repository | `auth-providers-api` |
 | Network | VPC `10.0.0.0/16` | `auth-provider-vpc` |
 | Database | RDS PostgreSQL 18.3 | `auth-provider-db` |
+| Cache | ElastiCache Serverless (Valkey 8) | `auth-providers` |
+| Media | S3 bucket | `auth-providers-media-<account-id>` |
 | Config | SSM parameters | `/auth-providers/api/*` |
 | Compute | ECS cluster / service | `auth-providers` / `api` |
 | Entry | ALB / target group | `auth-providers-alb` / `auth-providers-api` |
@@ -897,13 +902,253 @@ CloudWatch → **Alarms** → **Create alarm** → Select metric → **Applicati
 
 ![Alarm api-5xx on HTTPCode_Target_5XX_Count](images/42-cloudwatch-alarm.png)
 
-## 22. Verification
+## 22. Cache (Valkey) and media storage (S3)
+
+Two additions to the running stack: a **Valkey** cache (ElastiCache Serverless, the Redis-compatible engine that AWS
+now recommends and prices lower than Redis OSS) for the order list, and an **S3 bucket** for order photos that the
+browser uploads and loads directly through presigned URLs. Both are production-style: the cache is private, encrypted
+in transit and password-protected; the bucket is private, encrypted and reachable only through signed links.
+
+```
+ECS task (SG auth-providers-api) ──6379/6380, TLS, user "app"──► Valkey Serverless (private subnets, SG auth-providers-redis)
+ECS task (task role auth-providers-task) ──S3 API via the S3 gateway endpoint──► bucket auth-providers-media-<account-id>
+Browser ──presigned PUT / GET (CORS)──► bucket auth-providers-media-<account-id>
+```
+
+### 22.1 Security group for the cache
+
+EC2 → **Security groups** → **Create security group**, VPC `auth-provider-vpc`:
+
+| Field | Value |
+|---|---|
+| Name | `auth-providers-redis` |
+| Description | `Valkey: 6379/6380 from the ECS tasks` |
+| Inbound | Custom TCP **6379**, source security group `auth-providers-api` |
+| Inbound | Custom TCP **6380**, source security group `auth-providers-api` |
+| Outbound | default (all) |
+
+A serverless cache has two endpoints: **6379** (primary, reads and writes) and **6380** (reader endpoint, reads from
+replicas). Only the API tasks may connect.
+
+![Security group auth-providers-redis: 6379 and 6380 from the api security group](images/50-sg-redis.png)
+
+### 22.2 Password in Secrets Manager
+
+The app user's password is generated, never typed, and handed to the task through Secrets Manager (like the RDS
+password).
+
+1. Generate a password without the characters ElastiCache doesn't allow (`,` `"` `/` `@` and spaces):
+   ```powershell
+   aws secretsmanager get-random-password --password-length 32 --exclude-characters ',"/@ ' --profile dev --query RandomPassword --output text
+   ```
+2. Secrets Manager → **Store a new secret** → **Other type of secret** → **Plaintext** → paste the password →
+   name `auth-providers/redis-password` → no rotation → Store.
+
+The secret is a plain string, not JSON, so the task definition references the whole secret ARN without a
+`:key::` suffix. Do not open *Retrieve secret value* when screen sharing.
+
+![Secret auth-providers/redis-password (value not shown)](images/51-secret-redis.png)
+
+### 22.3 ElastiCache user and user group
+
+Valkey with a user group enforces authentication (RBAC): only listed users with their passwords can connect.
+
+1. ElastiCache → **User management** → **Create user**:
+
+   | Field | Value |
+   |---|---|
+   | User ID | `auth-providers-app` |
+   | User name | `app` (what the client sends) |
+   | Engine | Valkey |
+   | Access string | `on ~* +@all` (enabled, all keys, all commands) |
+   | Authentication mode | Password → the password from §22.2 |
+
+2. ElastiCache → **User group management** → **Create user group**: ID `auth-providers`, engine **Valkey**, add the
+   user `auth-providers-app`.
+
+For the Redis OSS engine a group must contain a user named `default`, so people add a disabled one
+(`off -@all`). For **Valkey** the group was created with only the `app` user, so no anonymous `default` access exists.
+
+![User group auth-providers with the single user app, access string on ~* +@all](images/52-valkey-user-group.png)
+
+### 22.4 Valkey Serverless cache
+
+ElastiCache → **Valkey caches** → **Create Valkey cache** → **Serverless** → **Customize default settings**:
+
+| Section | Field | Value |
+|---|---|---|
+| Settings | Name | `auth-providers` |
+| | Engine version | 8 (major; minor upgrades are automatic) |
+| Connectivity | VPC | `auth-provider-vpc` |
+| | Subnets | `private-1`, `private-2` |
+| | Security groups | `auth-providers-redis` only (remove `default`) |
+| Security | Encryption in transit | always on for serverless (TLS, cannot be disabled) |
+| | Encryption at rest | AWS owned key |
+| | Access control | **User group access control list** → `auth-providers` |
+| Usage limits | Maximum data storage | **1 GB** |
+| | Maximum ECPU per second | **5 000** |
+| Backups | Daily automatic backups | on, start **03:00 UTC**, retention **1** day |
+
+- Serverless replicates across AZs by itself; there are no nodes to size.
+- The usage limits are the cost ceiling: at the limit requests slow down instead of the bill growing.
+- Result: endpoint `auth-providers-<id>.serverless.euw1.cache.amazonaws.com:6379`.
+
+![Valkey cache auth-providers: available, engine 8.1, endpoint :6379, 1 GB and 5 000 ECPU/s limits](images/53-valkey-overview.png)
+
+![Cache connectivity and security: private subnets, encryption in transit, user group, backups](images/54-valkey-connectivity-security.png)
+
+**Client side.** A serverless cache works in cluster mode and requires TLS, so the app uses a cluster-aware client
+with SSL and the user/password passed separately (never inside a URL: a generated password would need URL-encoding,
+the same trap as `%` in the database password in §18.1):
+
+```python
+from redis.asyncio.cluster import RedisCluster
+
+RedisCluster(host=s.HOST, port=s.PORT, username=s.USERNAME, password=s.PASSWORD,
+             ssl=True, decode_responses=True, socket_connect_timeout=2, socket_timeout=2)
+```
+
+Locally (docker-compose, plain Valkey without TLS and auth) the same settings switch to a regular `Redis` client with
+`REDIS__CLUSTER=false`, `REDIS__SSL=false`.
+
+### 22.5 Media bucket
+
+S3 → **Create bucket**, region eu-west-1:
+
+| Field | Value |
+|---|---|
+| Bucket name | `auth-providers-media-<account-id>` (globally unique) |
+| Object Ownership | ACLs disabled |
+| Block Public Access | **Block all public access** |
+| Versioning | disabled |
+| Default encryption | SSE-S3 |
+
+![Default encryption SSE-S3](images/55-s3-media-encryption.png)
+
+![Block all public access: on](images/56-s3-media-block-public-access.png)
+
+**CORS** (Permissions → Cross-origin resource sharing → Edit). The browser talks to S3 directly (presigned PUT for the
+upload, GET for `<img>`), so the bucket must allow the frontend origin:
+
+```json
+[
+  {
+    "AllowedHeaders": ["*"],
+    "AllowedMethods": ["GET", "HEAD", "PUT"],
+    "AllowedOrigins": ["https://app.dimak-auth.xyz"],
+    "ExposeHeaders": ["ETag"],
+    "MaxAgeSeconds": 3000
+  }
+]
+```
+
+![Bucket CORS for https://app.dimak-auth.xyz](images/57-s3-media-cors.png)
+
+**Lifecycle rule** (Management → Create lifecycle rule): name `expire-unattached-uploads`, prefix **`tmp/`**, expire
+current versions after **1 day**. It is meant for uploads that were never attached to an order (upload to `tmp/`,
+copy to a permanent prefix when the order is created). The app currently stores photos under `uploads/`, which the
+rule does not touch.
+
+![Lifecycle rule expire-unattached-uploads: prefix tmp/, objects expire after 1 day](images/58-s3-media-lifecycle.png)
+
+### 22.6 Task role for S3
+
+The **execution role** (§12) is used by ECS to *start* the task. Code *inside* the container (boto3) needs its own
+**task role**. Without one, boto3 has no credentials at all; with it, boto3 picks up short-lived keys automatically
+and nothing is stored in environment variables.
+
+IAM → **Roles** → **Create role** → AWS service → Elastic Container Service → **Elastic Container Service Task** →
+no managed policies → name `auth-providers-task` → then **Add permissions** → **Create inline policy** (JSON):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Objects",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::auth-providers-media-<account-id>/*"
+    },
+    {
+      "Sid": "List",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::auth-providers-media-<account-id>"
+    }
+  ]
+}
+```
+
+- Object actions apply to `bucket/*`, `ListBucket` to the bucket itself: two different resources, two statements.
+- A presigned URL works only if the signer may do the action itself: `PutObject` / `GetObject` are needed for the
+  links handed to the browser.
+- `s3:ListBucket` matters for `head_object`: without it a missing key returns **403** instead of **404**, and the
+  app can't tell "not uploaded yet" from "access denied".
+
+![Task role with the inline media bucket policy](images/59-iam-task-role-policy.png)
+
+(The role on the screenshot is named `auth-provers-task` — a typo in the first apply; the guide uses
+`auth-providers-task`.)
+
+### 22.7 Config and the task definition
+
+New SSM parameters under `/auth-providers/api/` (String):
+
+| Name | Value |
+|---|---|
+| `REDIS__HOST` | the cache endpoint host (without `:6379`) |
+| `REDIS__PORT` | `6379` |
+| `REDIS__SSL` | `true` |
+| `REDIS__CLUSTER` | `true` |
+| `REDIS__USERNAME` | `app` |
+| `S3__BUCKET` | `auth-providers-media-<account-id>` |
+| `S3__REGION` | `eu-west-1` |
+
+The double underscore is pydantic-settings' nested delimiter: `REDIS__HOST` fills `settings.REDIS.HOST`.
+`S3__ENDPOINT_URL`, `S3__PUBLIC_ENDPOINT_URL` and S3 keys are **not** set in AWS: they exist only for the local
+S3-compatible storage.
+
+Permissions for the execution role (§12, inline policy): add the Redis secret ARN to the
+`secretsmanager:GetSecretValue` statement; the new parameters are covered by `parameter/auth-providers/api/*`.
+
+Task definition → **Create new revision**:
+- **Task role:** `auth-providers-task`;
+- container `api` → Environment variables → add the seven parameters above as **ValueFrom** (SSM ARNs) and
+  `REDIS__PASSWORD` as **ValueFrom** = the secret ARN `arn:aws:secretsmanager:…:secret:auth-providers/redis-password-…`.
+
+![Task definition revision with task role and execution role](images/60-ecs-taskdef-task-role.png)
+
+![REDIS__* and S3__* variables via valueFrom; REDIS__PASSWORD from Secrets Manager](images/61-ecs-taskdef-redis-s3-vars.png)
+
+Then update the service to the new revision. The GitHub deploy role (CI registers revisions) now also needs
+`iam:PassRole` on the task role, otherwise `RegisterTaskDefinition` fails.
+
+### 22.8 How the app uses them
+
+- **Order list cache** (`orders:<user_id>`, 60 s, probabilistic early refresh "XFetch"): stored as JSON; the cache is
+  dropped when an order is created. If the cache is unavailable, the service falls back to the database.
+- **Photo upload in one form:**
+  1. as soon as a file is picked, the frontend calls `POST /api/v1/orders/uploads` with `{"content_type": "image/webp"}`;
+     the API answers with a presigned PUT URL and the key `uploads/<user-id>/<uuid>.webp`;
+  2. the browser PUTs the file straight to S3 (same `Content-Type` as signed, otherwise 403);
+  3. `POST /api/v1/orders` carries the key; the API checks the key prefix belongs to the user and that the object
+     exists (`head_object`), then stores only the **key** in the database;
+  4. order responses carry `photo_url` — a presigned GET generated on every read (links expire, keys don't).
+- **Regional endpoint for presigned URLs:** boto3 must sign for `https://<bucket>.s3.eu-west-1.amazonaws.com`. A URL
+  for the global host `<bucket>.s3.amazonaws.com` gets **307 Temporary Redirect** for a new bucket outside us-east-1,
+  and browsers don't follow redirects in CORS requests — it shows up as a CORS error.
+- `/readyz` pings both the database and the cache; the ALB health check stays on the shallow `/healthz`.
+
+![Orders with photo thumbnails (user photos blurred)](images/62-app-order-photos.png)
+
+## 23. Verification
 
 From outside:
 
 ```powershell
 curl.exe -i https://api.dimak-auth.xyz/healthz          # 200 {"status":"ok"}
-curl.exe -i https://api.dimak-auth.xyz/readyz           # 200 (DB reachable, migrations ran)
+curl.exe -i https://api.dimak-auth.xyz/readyz           # 200 (DB and cache reachable, migrations ran)
 curl.exe -i http://api.dimak-auth.xyz/healthz           # 301 → https://
 curl.exe -i https://api.dimak-auth.xyz/api/v1/users/me  # 401 without a token
 ```
@@ -921,14 +1166,15 @@ curl.exe -i https://api.dimak-auth.xyz/api/v1/users/me  # 401 without a token
 3. Listener default action → forward to target group `auth-providers-api` (type IP, HTTP:8000, health check `/healthz`).
 4. ECS service `api` (load balancer block: container `api`, port 8000) registers each task's IP in the target group.
 5. Task ENI in a private subnet with SG `auth-providers-api` (allows 8000 only from the ALB SG) → container port 8000.
-6. Container → RDS on 5432 (SG `auth-providers-rds` allows only the api SG); outbound to the internet (JWKS) via the
-   NAT; image layers via the S3 gateway endpoint.
+6. Container → RDS on 5432 (SG `auth-providers-rds` allows only the api SG) and Valkey on 6379 over TLS
+   (SG `auth-providers-redis`); outbound to the internet (JWKS) via the NAT; image layers and the media bucket via
+   the S3 gateway endpoint.
 
-## 23. Costs and pausing overnight
+## 24. Costs and pausing overnight
 
 | Free | Paid |
 |---|---|
-| VPC, subnets, IGW, route tables, security groups, S3 gateway endpoint, ACM certificate, SSM Standard parameters | NAT gateway (~$1–2/day incl. its public IP), ALB, Fargate tasks, RDS, Route 53 zone ($0.50/month), Secrets Manager ($0.40/secret/month), ECR/S3 storage (cents), Amplify builds/hosting |
+| VPC, subnets, IGW, route tables, security groups, S3 gateway endpoint, ACM certificate, SSM Standard parameters | NAT gateway (~$1–2/day incl. its public IP), ALB, Fargate tasks, RDS, Route 53 zone ($0.50/month), Secrets Manager ($0.40/secret/month, two secrets), Valkey Serverless (from ~$6/month + ECPU per request), ECR/S3 storage and requests (cents), Amplify builds/hosting |
 
 To pause the NAT (the most expensive idle item before the ALB/ECS/RDS exist):
 1. Delete the NAT gateway first and wait for `deleted` (an Elastic IP can't be released while associated:
@@ -937,7 +1183,7 @@ To pause the NAT (the most expensive idle item before the ALB/ECS/RDS exist):
 3. To resume: create a new NAT (Regional, Allocate Elastic IP) → `auth-private` → Routes → edit `0.0.0.0/0`
    (now `blackhole`) → the new NAT. Subnet associations stay as they are.
 
-## 24. Notes for Terraform
+## 25. Notes for Terraform
 
 - **Data sources only:** `aws_route53_zone` (the hosted zone is kept between rebuilds) and `aws_acm_certificate`
   (or create the certificate in Terraform too). State: S3 bucket `dimak-auth-tfstate-<account-id>` with
@@ -959,10 +1205,17 @@ To pause the NAT (the most expensive idle item before the ALB/ECS/RDS exist):
 - **ECR:** `image_tag_mutability = "IMMUTABLE"`, scan on push, lifecycle policy (keep 10, `tagStatus = "any"`).
 - **Observability:** log group with retention, SNS topic + email subscription (must be confirmed by hand),
   `aws_cloudwatch_metric_alarm` on `HTTPCode_Target_5XX_Count`.
+- **Valkey:** `random_password` → `aws_secretsmanager_secret` (`recovery_window_in_days = 0`, otherwise the name stays
+  blocked for 7–30 days after destroy) → `aws_elasticache_user` + `aws_elasticache_user_group` (engine `valkey`) →
+  `aws_elasticache_serverless_cache` with `cache_usage_limits`; SG with 6379/6380 from the api SG. The task service
+  should `depends_on` the secret **version**, not only the secret.
+- **S3 media:** bucket + `aws_s3_bucket_public_access_block`, `_server_side_encryption_configuration`,
+  `_cors_configuration`, `_lifecycle_configuration` (separate resources); task role with an inline policy;
+  `task_role_arn` on the task definition; `iam:PassRole` on the task role for the CI deploy role.
 - **CI (GitHub Actions + OIDC):** build with `--provenance=false --sbom=false`, push `:<git sha>`, register a new task
   definition revision with the new image, update the service.
 
-## 25. Troubleshooting
+## 26. Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
@@ -980,3 +1233,9 @@ To pause the NAT (the most expensive idle item before the ALB/ECS/RDS exist):
 | Alarm never fires on app 500s | `HTTPCode_ELB_5XX_Count` chosen | use `HTTPCode_Target_5XX_Count` |
 | Changed `VITE_*` has no effect | Vite inlines env at build time | Amplify → Redeploy this version |
 | Container health `Unknown` | no container health check defined | expected; the ALB health check decides |
+| Browser upload to S3 fails with a CORS error, network tab shows `307 Temporary Redirect` | presigned URL signed for the global `<bucket>.s3.amazonaws.com` host; new buckets outside us-east-1 redirect | sign with the regional endpoint `https://s3.<region>.amazonaws.com` |
+| `head_object` raises 403 for a key that doesn't exist | task role lacks `s3:ListBucket` | add `ListBucket` on the bucket ARN |
+| Presigned PUT returns 403 `SignatureDoesNotMatch` | browser sent another `Content-Type` than the URL was signed for | send exactly the signed type |
+| App can't connect to the cache: timeouts or `MOVED` errors | plain client / no TLS against a serverless cache | `RedisCluster` with `ssl=True` |
+| `RegisterTaskDefinition` fails in CI after adding a task role | deploy role lacks `iam:PassRole` on the task role | add the task role ARN to the PassRole statement |
+| `apply` after `destroy`: secret name already scheduled for deletion | Secrets Manager recovery window | `recovery_window_in_days = 0` (or restore/force-delete the secret) |

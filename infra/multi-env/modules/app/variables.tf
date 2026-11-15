@@ -55,6 +55,16 @@ variable "on_demand_weight" {
   description = "FARGATE weight next to FARGATE_SPOT weight 1 (0 = everything above base on Spot)"
 }
 
+variable "redis_max_storage_gb" {
+  type    = number
+  default = 1
+}
+
+variable "redis_max_ecpu_per_second" {
+  type    = number
+  default = 5000
+}
+
 variable "db_deletion_protection" {
   type    = bool
   default = false

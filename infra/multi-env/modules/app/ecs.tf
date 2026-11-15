@@ -15,6 +15,7 @@ locals {
     [
       { name = "POSTGRES_USER", valueFrom = "${local.db_secret_arn}:username::" },
       { name = "POSTGRES_PASSWORD", valueFrom = "${local.db_secret_arn}:password::" },
+      { name = "REDIS__PASSWORD", valueFrom = aws_secretsmanager_secret.redis.arn },
     ]
   )
 }
@@ -26,6 +27,7 @@ resource "aws_ecs_task_definition" "api" {
   cpu                      = 512
   memory                   = 1024
   execution_role_arn       = aws_iam_role.task_execution.arn
+  task_role_arn            = aws_iam_role.task.arn
 
   runtime_platform {
     operating_system_family = "LINUX"
@@ -91,7 +93,8 @@ resource "aws_ecs_service" "api" {
     ignore_changes = [task_definition, desired_count]
   }
 
-  depends_on = [aws_lb_listener.https, aws_ecs_cluster_capacity_providers.main]
+  # the task definition references the secret, not its version: wait until the password is stored
+  depends_on = [aws_lb_listener.https, aws_ecs_cluster_capacity_providers.main, aws_secretsmanager_secret_version.redis]
 }
 
 resource "aws_appautoscaling_target" "api" {

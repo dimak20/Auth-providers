@@ -1,6 +1,7 @@
 # Infrastructure (Terraform)
 
-Two independent layouts of the same AWS stack (ECS Fargate + ALB + RDS + Amplify, eu-west-1).
+Two independent layouts of the same AWS stack (ECS Fargate + ALB + RDS + Valkey Serverless + S3 media + Amplify,
+eu-west-1).
 Use **one of them at a time**: both create resources with overlapping names (ECR repository, GitHub OIDC
 provider, Route 53 records).
 
@@ -29,7 +30,8 @@ infra/
 - `terraform.tfvars` (committed): `supabase_ref`, `supabase_publishable_key`, `image_tag`.
 - `private.auto.tfvars` (gitignored): `alert_email`, `github_token` (classic PAT, scope `repo`; only needed
   while the Amplify app is created, revoke it afterwards).
-- Requires Terraform ≥ 1.15 for `aws login` credentials (`profile = "dev"`).
+- Requires Terraform ≥ 1.15 for `aws login` credentials (`profile = "dev"`) and the `hashicorp/random` provider
+  (Valkey password; `terraform init -upgrade` after pulling).
 
 ## multi-env: bring up
 

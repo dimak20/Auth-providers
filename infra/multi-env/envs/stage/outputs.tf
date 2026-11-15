@@ -25,3 +25,11 @@ output "amplify_app_id" {
 output "github_deploy_role_arn" {
   value = module.app.github_deploy_role_arn
 }
+
+output "redis_endpoint" {
+  value = module.app.redis_endpoint
+}
+
+output "media_bucket" {
+  value = module.app.media_bucket
+}

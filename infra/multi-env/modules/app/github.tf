@@ -64,9 +64,9 @@ data "aws_iam_policy_document" "github_deploy" {
   }
 
   statement {
-    sid       = "PassExecutionRole"
+    sid       = "PassTaskRoles"
     actions   = ["iam:PassRole"]
-    resources = [aws_iam_role.task_execution.arn]
+    resources = [aws_iam_role.task_execution.arn, aws_iam_role.task.arn]
     condition {
       test     = "StringEquals"
       variable = "iam:PassedToService"

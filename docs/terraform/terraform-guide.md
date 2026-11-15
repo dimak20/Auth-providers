@@ -42,8 +42,8 @@ Created **once by hand** and only read by Terraform through `data` sources. They
 | S3 bucket `dimak-auth-tfstate-<account-id>` | Terraform can't keep its state in a bucket it creates itself |
 | AWS Amplify GitHub App installation on the repo | GitHub requires a human to approve an app installation in the browser |
 
-Everything else (VPC, RDS, ECS, ALB, DNS records, SSM, IAM, ECR, Amplify app, alerts, GitHub deploy role) is in
-Terraform.
+Everything else (VPC, RDS, Valkey cache, S3 media bucket, ECS, ALB, DNS records, SSM, IAM, ECR, Amplify app, alerts,
+GitHub deploy role) is in Terraform.
 
 ## 2. Prerequisites
 
@@ -57,7 +57,7 @@ Terraform.
   credential_process = aws configure export-credentials --profile dev --format process
   ```
   When the `aws login` session expires, commands fail with *Your session has expired*: run `aws login` again.
-- AWS provider `~> 6.0` (regional NAT gateway support).
+- AWS provider `~> 6.0` (regional NAT gateway support) and `hashicorp/random ~> 3.6` (the Valkey password).
 - The manual resources from §1. The console guide (§3 DNS, §5 state bucket, §6 ACM) shows how to create them.
 - The AWS Amplify GitHub App installed on the repository: open
   `https://github.com/apps/aws-amplify-eu-west-1/installations/new` → your account → **Only select repositories**
@@ -101,7 +101,7 @@ Terraform reads **all `.tf` files of a folder** as one configuration; the split 
 | `terraform.tfvars` | values for this environment (committed) |
 | `private.auto.tfvars` | private values: alert email, GitHub token (gitignored, loaded automatically) |
 | `data.tf` | lookups of existing things (zone, certificate, AZs) |
-| `network.tf`, `security.tf`, `rds.tf`, … | resources by area |
+| `network.tf`, `security.tf`, `rds.tf`, `redis.tf`, `s3.tf`, … | resources by area |
 | `outputs.tf` | values printed after apply and used by CI |
 
 `.gitignore` must contain `.terraform/`, `*.tfstate`, `*.tfstate.*`, `private.auto.tfvars`.
@@ -791,11 +791,274 @@ gh api repos/<owner>/Auth-providers/actions/oidc/customization/sub
 ```
 The immutable form is safer: a renamed or re-created repository with the same name gets a different id.
 
+### 4.18 Cache: Valkey Serverless (`redis.tf`, `security.tf`)
+
+A production-style cache: private subnets, TLS always on (serverless can't disable it), password authentication
+through a user group, a cost ceiling, daily snapshots.
+
+`versions.tf` gets a second provider (run `terraform init -upgrade` after adding it; the lock file changes):
+```hcl
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.6"
+    }
+```
+
+Security group (in `security.tf`; add `redis = aws_security_group.redis.id` to the egress map from §4.7):
+```hcl
+resource "aws_security_group" "redis" {
+  name        = "auth-providers-redis"
+  description = "Valkey: 6379/6380 from the ECS tasks"
+  vpc_id      = aws_vpc.main.id
+}
+
+resource "aws_vpc_security_group_ingress_rule" "redis_from_api" {
+  for_each = toset(["6379", "6380"])       # primary endpoint, reader endpoint
+
+  security_group_id            = aws_security_group.redis.id
+  referenced_security_group_id = aws_security_group.api.id
+  ip_protocol                  = "tcp"
+  from_port                    = tonumber(each.value)
+  to_port                      = tonumber(each.value)
+}
+```
+`for_each = toset([...])` makes the strings themselves the instance keys (`redis_from_api["6379"]`).
+
+`redis.tf`:
+```hcl
+resource "random_password" "redis" {
+  length           = 32
+  special          = true
+  override_special = "!#$%^&*()-_=+[]{}<>:?"   # ElastiCache rejects , " / @ and spaces
+}
+
+resource "aws_secretsmanager_secret" "redis" {
+  name                    = "auth-providers/redis-password"
+  recovery_window_in_days = 0   # otherwise the name stays blocked for 7–30 days after destroy
+}
+
+resource "aws_secretsmanager_secret_version" "redis" {
+  secret_id     = aws_secretsmanager_secret.redis.id
+  secret_string = random_password.redis.result   # plain string, not JSON
+}
+
+resource "aws_elasticache_user" "app" {
+  user_id       = "auth-providers-app"
+  user_name     = "app"
+  engine        = "valkey"
+  access_string = "on ~* +@all"                  # enabled, all keys, all commands
+  authentication_mode {
+    type      = "password"
+    passwords = [random_password.redis.result]
+  }
+}
+
+resource "aws_elasticache_user_group" "main" {
+  user_group_id = "auth-providers"
+  engine        = "valkey"
+  user_ids      = [aws_elasticache_user.app.user_id]
+}
+
+resource "aws_elasticache_serverless_cache" "main" {
+  name                 = "auth-providers"
+  engine               = "valkey"
+  major_engine_version = "8"
+
+  subnet_ids         = values(aws_subnet.private)[*].id
+  security_group_ids = [aws_security_group.redis.id]
+  user_group_id      = aws_elasticache_user_group.main.user_group_id
+
+  cache_usage_limits {                              # the cost ceiling
+    data_storage {
+      maximum = 1
+      unit    = "GB"
+    }
+    ecpu_per_second {
+      maximum = 5000
+    }
+  }
+
+  snapshot_retention_limit = 1
+  daily_snapshot_time      = "03:00"
+}
+
+output "redis_endpoint" {
+  value = aws_elasticache_serverless_cache.main.endpoint[0].address
+}
+```
+
+- **The `default` user.** For the Redis OSS engine a user group must contain a user named `default`, so people add a
+  disabled one (`user_name = "default"`, `access_string = "off -@all"`, `no-password-required`). With the **Valkey**
+  engine the group was accepted with only `app`, so nobody can connect without the password. Keep the disabled
+  `default` user at hand in case a provider/API version rejects the group.
+- **`endpoint` / `reader_endpoint`** are list blocks: `endpoint[0].address`, `endpoint[0].port`.
+- **The password ends up in the state** (unavoidable with `random_password`); the state bucket is private and
+  encrypted.
+
+Wiring it into the task:
+- `ssm.tf`, in `local.app_config`:
+  ```hcl
+      REDIS__HOST     = aws_elasticache_serverless_cache.main.endpoint[0].address
+      REDIS__PORT     = tostring(aws_elasticache_serverless_cache.main.endpoint[0].port)
+      REDIS__SSL      = "true"
+      REDIS__CLUSTER  = "true"
+      REDIS__USERNAME = aws_elasticache_user.app.user_name
+  ```
+  (`__` is pydantic-settings' `env_nested_delimiter`: `REDIS__HOST` → `settings.REDIS.HOST`.) The parameters and the
+  execution role's `ssm:GetParameters` statement pick them up automatically through `for_each` / `for`.
+- `ecs.tf`, in `local.container_secrets`: `{ name = "REDIS__PASSWORD", valueFrom = aws_secretsmanager_secret.redis.arn }`
+  (whole secret, no `:key::` suffix because the value is a plain string).
+- Execution role (`task_execution_extra` policy document): add `aws_secretsmanager_secret.redis.arn` to the
+  `secretsmanager:GetSecretValue` resources.
+- `aws_ecs_service.api`: add `aws_secretsmanager_secret_version.redis` to `depends_on`. The task definition references
+  the secret, not its version, so without it the first tasks can start before the password is stored and fail with
+  `ResourceInitializationError`. The cache itself needs no `depends_on`: its endpoint flows in through an SSM
+  parameter, which already makes Terraform wait for it.
+
+**Client side** (`src/infra/redis/client.py`): a serverless cache runs in cluster mode with TLS, so the app uses
+`RedisCluster(host, port, username, password, ssl=True, ...)`. Credentials go as separate arguments, never inside a
+URL (a generated password would need URL-encoding — the same trap as `%` in the DB password). Locally a plain Valkey
+container is used with `REDIS__CLUSTER=false`, `REDIS__SSL=false` (§4.20).
+
+### 4.19 Media: S3 bucket and the task role (`s3.tf`, `iam.tf`)
+
+Order photos live in a private bucket. The browser uploads (presigned PUT) and loads (presigned GET) them directly;
+the API only signs links and stores object **keys**. No VPC changes: the tasks reach S3 through the gateway endpoint
+from §4.6.
+
+`data.tf`: `data "aws_caller_identity" "current" {}` (account id for a globally unique bucket name).
+
+`s3.tf`:
+```hcl
+resource "aws_s3_bucket" "media" {
+  bucket        = "auth-providers-media-${data.aws_caller_identity.current.account_id}"
+  force_destroy = true   # destroy also deletes objects; false for a real prod
+}
+
+resource "aws_s3_bucket_public_access_block" "media" {
+  bucket                  = aws_s3_bucket.media.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "media" {
+  bucket = aws_s3_bucket.media.id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+resource "aws_s3_bucket_cors_configuration" "media" {   # browser PUT/GET via presigned URLs
+  bucket = aws_s3_bucket.media.id
+  cors_rule {
+    allowed_origins = var.cors_origins
+    allowed_methods = ["GET", "PUT", "HEAD"]
+    allowed_headers = ["*"]
+    expose_headers  = ["ETag"]
+    max_age_seconds = 3000
+  }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "media" {   # uploads never attached to an order
+  bucket = aws_s3_bucket.media.id
+  rule {
+    id     = "expire-unattached-uploads"
+    status = "Enabled"
+    filter {
+      prefix = "tmp/"
+    }
+    expiration {
+      days = 1
+    }
+  }
+}
+```
+Bucket settings are separate resources since provider v4 (like SG rules): each changes without touching the bucket.
+The lifecycle prefix is `tmp/` on purpose: the app currently keeps photos under `uploads/`; once uploads go to `tmp/`
+and are copied to a permanent prefix on order creation, the rule starts cleaning up abandoned files.
+
+Task role (`iam.tf`) — the role for **code inside the container** (boto3), as opposed to the execution role ECS uses
+to start the task:
+```hcl
+resource "aws_iam_role" "task" {
+  name               = "auth-providers-task"
+  assume_role_policy = data.aws_iam_policy_document.ecs_tasks_assume.json   # same trust: ecs-tasks.amazonaws.com
+}
+
+data "aws_iam_policy_document" "task_s3" {
+  statement {
+    sid       = "Objects"
+    actions   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
+    resources = ["${aws_s3_bucket.media.arn}/*"]
+  }
+  statement {
+    sid       = "List"      # without it head_object on a missing key returns 403 instead of 404
+    actions   = ["s3:ListBucket"]
+    resources = [aws_s3_bucket.media.arn]
+  }
+}
+
+resource "aws_iam_role_policy" "task_s3" {
+  name   = "media_bucket"
+  role   = aws_iam_role.task.id
+  policy = data.aws_iam_policy_document.task_s3.json
+}
+```
+- `aws_iam_role_policy_attachment` attaches an existing (managed) policy by ARN, reusable across roles;
+  `aws_iam_role_policy` creates an inline policy that lives inside one role. Managed AWS policy → attachment;
+  permissions specific to one role → inline.
+- A presigned URL only works if the signer may perform the action, hence `PutObject` / `GetObject` on the role.
+- `aws_ecs_task_definition.api`: `task_role_arn = aws_iam_role.task.arn`.
+- `ssm.tf`: `S3__BUCKET = aws_s3_bucket.media.bucket`, `S3__REGION = var.region`. No endpoint URLs and no keys in AWS:
+  boto3 uses the real S3 and the task role's short-lived credentials.
+- GitHub deploy role (§4.17): add `aws_iam_role.task.arn` to the `iam:PassRole` resources — a task definition that
+  references a task role can't be registered otherwise.
+
+**Client side** (`src/infra/media/client.py`): two boto3 clients — *internal* (server → storage: `head_object`,
+`delete_object`) and *public* (only signs URLs for the browser). In AWS both use the **regional** endpoint:
+```python
+regional = f"https://s3.{s.REGION}.amazonaws.com"
+internal = boto3.client("s3", endpoint_url=s.ENDPOINT_URL or regional, **common)
+public   = boto3.client("s3", endpoint_url=s.PUBLIC_ENDPOINT_URL or s.ENDPOINT_URL or regional, **common)
+```
+With the default global host (`<bucket>.s3.amazonaws.com`) a new bucket outside us-east-1 answers presigned requests
+with `307 Temporary Redirect`, which browsers don't follow in CORS requests — it surfaces as a CORS error.
+`generate_presigned_url` is pure signing (no network) and can be called in async code directly; `head_object` /
+`delete_object` go through `asyncio.to_thread`.
+
+Upload flow implemented on top of it: `POST /api/v1/orders/uploads {"content_type": …}` → `{upload_url, key}` →
+browser PUTs the file to S3 → `POST /api/v1/orders` with the key → the service checks the key prefix
+(`uploads/<user-id>/`) and `head_object`, stores the key → order responses carry a fresh presigned `photo_url`.
+
+### 4.20 Local development parity (docker-compose)
+
+The same code runs locally against containers instead of AWS services; only environment variables differ.
+
+| Service | Container | Settings in `.env` |
+|---|---|---|
+| Cache | `valkey/valkey:8` (no TLS, no auth) | `REDIS__HOST=redis`, `REDIS__PORT=6379`, `REDIS__SSL=false`, `REDIS__CLUSTER=false` |
+| S3 | `chrislusf/seaweedfs` with `server -s3` on port 8333, keys in `seaweedfs/s3.json` | `S3__ENDPOINT_URL=http://s3:8333`, `S3__PUBLIC_ENDPOINT_URL=http://localhost:8333`, `S3__ACCESS_KEY_ID`, `S3__SECRET_ACCESS_KEY` |
+| Bucket + CORS | one-shot `amazon/aws-cli` container (`s3-init`): waits for the API, `s3 mb`, `put-bucket-cors` from `seaweedfs/cors.json` | `S3__BUCKET`, `S3__REGION` |
+
+- Two S3 endpoints locally: inside the docker network the storage is `s3:8333`, but the browser can't resolve that
+  name, so links for the browser are signed with `localhost:8333`. Locally path-style addressing is used
+  (`addressing_style = "path"`), in AWS virtual-hosted.
+- Why SeaweedFS: `minio/minio` images are no longer published on Docker Hub, and the current `localstack/localstack`
+  image exits without a `LOCALSTACK_AUTH_TOKEN`.
+- `api` waits for Valkey (`healthcheck: valkey-cli ping`) and for `s3-init` to finish.
+
 ## 5. First image, first apply, first frontend build
 
 ECS can't start without an image, so the repository and the first image come before the service. Practical order:
 
-1. `terraform apply` up to ECR (or apply everything and expect the service to wait for the image).
+1. Create only the repository first, so there is somewhere to push:
+   ```powershell
+   terraform apply -target="aws_ecr_repository.api" -target="aws_ecr_lifecycle_policy.api"
+   ```
 2. Push the first image (from the root folder of the configuration; the build context is the repository root):
    ```powershell
    $REPO = terraform output -raw ecr_repository_url
@@ -807,11 +1070,12 @@ ECS can't start without an image, so the repository and the first image come bef
    ```
    `--provenance=false --sbom=false`: otherwise buildx pushes an OCI index plus attestations, and basic ECR
    scanning ignores the image.
-3. Put `$TAG` into `image_tag` in `terraform.tfvars`, `terraform apply`.
+3. Put `$TAG` into `image_tag` in `terraform.tfvars`, then the full `terraform apply` (~15 minutes; RDS, the Valkey
+   cache and the NAT take longest). Commit the app code before building, so the tag (git SHA) matches the code.
 4. Check:
    ```powershell
    curl.exe https://api.dimak-auth.xyz/healthz      # 200
-   curl.exe https://api.dimak-auth.xyz/readyz       # 200: DB reachable, migrations ran
+   curl.exe https://api.dimak-auth.xyz/readyz       # 200: DB and cache reachable, migrations ran
    ```
 5. Frontend: creating an Amplify app and branch through the API does **not** start a build (the console wizard
    does that itself; afterwards builds are triggered by the GitHub webhook on push). The custom domain stays
@@ -820,6 +1084,8 @@ ECS can't start without an image, so the repository and the first image come bef
    aws amplify start-job --app-id <app-id> --branch-name main --job-type RELEASE --profile dev --region eu-west-1
    ```
 6. Supabase → Authentication → URL Configuration: Site URL and Redirect URLs must contain the frontend URL.
+7. Upload a photo with a new order on `app.dimak-auth.xyz`: the object appears under `uploads/<user-id>/` in the
+   media bucket and the thumbnail loads in the list.
 
 ## 6. CD with GitHub Actions and OIDC
 
@@ -882,6 +1148,10 @@ not by who is logged in to the AWS CLI — both environments live in the same ac
 | Tasks | 1–2, all on Fargate Spot | 2–4, one always on regular Fargate |
 | Frontend | Amplify builds on every push to `main` | built only by CD after approval (`amplify_auto_build = false`) |
 | Deploy role trusts | GitHub Environment `staging` | GitHub Environment `production` |
+| Valkey cache / user / group | `auth-providers-stage` / `auth-providers-stage-app` | `auth-providers-prod` / `auth-providers-prod-app` |
+| Redis password secret | `auth-providers/stage/redis-password` | `auth-providers/prod/redis-password` |
+| Media bucket (CORS origin) | `auth-providers-stage-media-<account-id>` (`app-stage…`) | `auth-providers-prod-media-<account-id>` (`app…`) |
+| Task role | `auth-providers-stage-task` | `auth-providers-prod-task` |
 | State key | `stage/terraform.tfstate` | `prod/terraform.tfstate` |
 
 Shared by both (`envs/shared`, applied first, destroyed last): the ECR repository (one image is promoted from stage
@@ -907,13 +1177,19 @@ Also shared, outside Terraform: the hosted zone and the wildcard certificate. `a
   ```
 - SSM path `/auth-providers/<env>/api/*`; `CORS_ORIGINS` is built from the frontend domain.
 - Fargate/Spot split, task counts and deletion protection are variables.
+- Valkey and S3 (§4.18, §4.19) live in the module (`redis.tf`, `s3.tf`): one cache, one password secret, one
+  media bucket and one task role per environment. The cache limits are variables (`redis_max_storage_gb`,
+  `redis_max_ecpu_per_second`, defaults 1 GB / 5 000). The bucket CORS origin is the environment's own frontend
+  domain. The module declares `hashicorp/random` in its `versions.tf`; the env roots declare it too, so their lock
+  files pin it.
 - Amplify: one app per environment. The domain association registers the **full subdomain**
   (`domain_name = "app-stage.dimak-auth.xyz"`, `prefix = ""`) instead of the apex with a prefix, so two apps never
   claim the same domain.
 - The deploy role trusts `…:environment:<name>` and may additionally run `ecr:DescribeImages` and
-  `amplify:StartJob` / `amplify:GetJob` on its own Amplify branch.
+  `amplify:StartJob` / `amplify:GetJob` on its own Amplify branch; `iam:PassRole` covers both the execution role
+  and the task role of its environment.
 - Outputs: `api_url`, `app_url`, `ecs_cluster`, `ecs_service`, `task_family`, `amplify_app_id`,
-  `github_deploy_role_arn`.
+  `github_deploy_role_arn`, `redis_endpoint`, `media_bucket`.
 
 ### 7.4 Alternatives (not used here)
 
@@ -977,7 +1253,7 @@ build (`amplify start-job` or the next push), first prod frontend build (the wor
 
 ```powershell
 curl.exe https://api-stage.dimak-auth.xyz/healthz            # 200
-curl.exe https://api.dimak-auth.xyz/readyz                   # 200
+curl.exe https://api.dimak-auth.xyz/readyz                   # 200, body [] (DB and cache ok)
 curl.exe https://api.dimak-auth.xyz/api/v1/users/me          # 401 without a token
 curl.exe -I https://app.dimak-auth.xyz/orders                # 200, no redirect to /orders/
 terraform plan -detailed-exitcode                            # exit code 0 = no drift
@@ -1015,6 +1291,16 @@ Switching layouts: destroy one completely before applying the other; then point 
 | After importing RDS: `engine_version "18.3" -> "18"` | imported state holds the full version | apply, or recreate the empty DB with `-replace` |
 | Two Amplify apps, one domain | an apex domain can be associated with one app only | associate the full subdomain per app |
 | `deploy-prod` ran without a pause | `production` has no Required reviewers rule | add the rule in the environment settings |
+| `Missing required provider … hashicorp/random` | new provider added, not installed | `terraform init -upgrade` (re-run `aws login` first if the session expired) |
+| First tasks fail with `ResourceInitializationError` on `REDIS__PASSWORD` | service started before the secret value was written | `depends_on = [aws_secretsmanager_secret_version.redis]` on the service |
+| `apply` after `destroy`: secret name already scheduled for deletion | Secrets Manager recovery window | `recovery_window_in_days = 0` |
+| App can't reach the cache: timeouts, `MOVED` / `CROSSSLOT` | plain client or no TLS against a serverless cache | `RedisCluster`, `ssl=True` |
+| Browser upload: CORS error, network tab shows `307 Temporary Redirect` | URL signed for the global S3 host | sign with `https://s3.<region>.amazonaws.com` |
+| `head_object` → 403 for a key that isn't there | task role without `s3:ListBucket` | add `ListBucket` on the bucket ARN |
+| Presigned PUT → 403 `SignatureDoesNotMatch` | browser sent a different `Content-Type` than signed | send exactly the signed type |
+| CI: `RegisterTaskDefinition` access denied after adding a task role | deploy role lacks `iam:PassRole` on the task role | add the task role to the PassRole statement |
+| Locally `pull access denied for minio/minio` / LocalStack exits asking for a license | images no longer published / token now required | SeaweedFS (§4.20) |
+| Cached order list loses photos | cache `decode` didn't restore `photo_key` | rebuild every domain field in `decode` |
 
 How the orphans after an interrupted `apply` were found: compare everything tagged with the environment
 (`default_tags`) with the ids in the state.
@@ -1033,8 +1319,9 @@ eu-west-1, on demand, everything running 24/7, approximate:
 | ALB(s) | ~20 | ~40 |
 | Fargate (prod 1 regular + 1 Spot, stage 1 Spot) | ~25 | ~30 |
 | RDS `db.t4g.micro` + 20 GB gp3 | ~16 | ~32 |
+| Valkey Serverless (minimum + ECPU) and the media bucket | ~6–10 | ~12–20 |
 | Route 53, Secrets Manager, ECR, logs, alarms, Amplify | ~3–5 | ~5–8 |
-| **Total, $/month** | **~110–150** | **~210–280** |
+| **Total, $/month** | **~115–160** | **~225–300** |
 
 Roughly $0.3–0.4 per hour for both environments together. The network (NAT, ALB, IPv4) costs more than the compute.
 Check the account's plan and credits with `aws freetier get-account-plan-state --region us-east-1` and set an AWS
